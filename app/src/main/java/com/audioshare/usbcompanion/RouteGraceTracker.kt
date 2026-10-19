@@ -1,27 +1,22 @@
 package com.audioshare.usbcompanion
 
 /**
- * Keeps a short, renewable grace period for transiently invalid route data.
- * Android can briefly report no route or an old route while rebuilding its
- * audio policy. Either condition is fatal only when it remains continuous.
+ * Keeps a short, renewable grace period for a transiently missing audio route.
+ * Android can briefly report no route while rebuilding its audio policy after
+ * a Bluetooth or wired-headset transition. A missing route is fatal only when
+ * it remains continuous for the full grace window. Any concrete output device
+ * (built-in speaker, Bluetooth A2DP, wired headset, USB, ...) is valid.
  */
 internal class RouteGraceTracker(
     private val graceNanos: Long,
 ) {
     private var invalidSinceNanos: Long? = null
 
-    fun observe(
-        nowNanos: Long,
-        routedToSpeaker: Boolean,
-        routedToOtherDevice: Boolean,
-    ): Observation {
-        require(!(routedToSpeaker && routedToOtherDevice))
-        if (routedToSpeaker) {
+    fun observe(nowNanos: Long, routed: Boolean): Observation {
+        if (routed) {
             invalidSinceNanos = null
             return Observation.VALID
         }
-        // Missing and explicitly wrong routes receive the same bounded
-        // recovery window; the separate booleans reject ambiguous callers.
         val since = invalidSinceNanos ?: nowNanos.also { invalidSinceNanos = it }
         return if (nowNanos - since >= graceNanos) {
             Observation.EXPIRED

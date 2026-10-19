@@ -10,19 +10,19 @@ class RouteGraceTrackerTest {
     fun transientMissingRouteGetsFreshGraceWindow() {
         assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(10_000L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(10_000L, routed = false),
         )
         assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(500_000_000L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(500_000_000L, routed = false),
         )
         assertEquals(
             RouteGraceTracker.Observation.VALID,
-            tracker.observe(500_000_001L, routedToSpeaker = true, routedToOtherDevice = false),
+            tracker.observe(500_000_001L, routed = true),
         )
         assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(3_000_000_000L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(3_000_000_000L, routed = false),
         )
     }
 
@@ -30,35 +30,45 @@ class RouteGraceTrackerTest {
     fun continuouslyMissingRouteExpires() {
         assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(0L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(0L, routed = false),
         )
         assertEquals(
             RouteGraceTracker.Observation.EXPIRED,
-            tracker.observe(2_000_000_000L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(2_000_000_000L, routed = false),
         )
     }
 
     @Test
-    fun wrongRouteGetsTimeToRecoverBeforeItExpires() {
+    fun concreteRouteResetsGraceAndStaysValid() {
         assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(1L, routedToSpeaker = false, routedToOtherDevice = true),
-        )
-        assertEquals(
-            RouteGraceTracker.Observation.GRACE,
-            tracker.observe(1_000_000_001L, routedToSpeaker = false, routedToOtherDevice = true),
-        )
-        assertEquals(
-            RouteGraceTracker.Observation.EXPIRED,
-            tracker.observe(2_000_000_001L, routedToSpeaker = false, routedToOtherDevice = true),
+            tracker.observe(1L, routed = false),
         )
         assertEquals(
             RouteGraceTracker.Observation.VALID,
-            tracker.observe(2_000_000_002L, routedToSpeaker = true, routedToOtherDevice = false),
+            tracker.observe(1_000_000_001L, routed = true),
         )
         assertEquals(
+            RouteGraceTracker.Observation.VALID,
+            tracker.observe(1_500_000_001L, routed = true),
+        )
+        // A fresh missing route after a valid one gets a new grace window,
+        // rather than reusing an expired deadline.
+        assertEquals(
             RouteGraceTracker.Observation.GRACE,
-            tracker.observe(4_000_000_003L, routedToSpeaker = false, routedToOtherDevice = false),
+            tracker.observe(4_000_000_003L, routed = false),
+        )
+    }
+
+    @Test
+    fun routeReturningInsideGraceIsValid() {
+        assertEquals(
+            RouteGraceTracker.Observation.GRACE,
+            tracker.observe(0L, routed = false),
+        )
+        assertEquals(
+            RouteGraceTracker.Observation.VALID,
+            tracker.observe(1_999_999_999L, routed = true),
         )
     }
 }

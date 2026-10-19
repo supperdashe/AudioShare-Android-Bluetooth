@@ -2,6 +2,14 @@
 
 Native Android receiver for the customized AudioShare Windows host.
 
+> **Bluetooth-routing modification (unofficial, self-built).** This build removes
+> the original *enforced built-in-speaker* routing so received PC audio follows
+> Android's normal media routing — including Bluetooth A2DP headsets, wired
+> headsets, and USB audio — while keeping built-in-speaker playback when no other
+> output is active. It is a derivative of
+> [CodeinScrubs/AudioShare-Android](https://github.com/CodeinScrubs/AudioShare-Android)
+> and is **not** an official release. See “Bluetooth output routing” below.
+
 ## Looking for the app to use?
 
 Ordinary users should **not** clone or build this Android repository and do not
@@ -57,11 +65,12 @@ promoted to stable. See [`docs/HARDWARE_TEST_RESULTS.md`](docs/HARDWARE_TEST_RES
   bridge never blocks first connection with a permission dialog. If permission
   is declined, playback still works and can be stopped from Windows or
   Android's foreground-service Task Manager.
-- Playback verifies the actual Android audio route after writing starts and
-  fails visibly if the OS routes PC audio anywhere except the built-in speaker.
-  A temporary missing or stale Bluetooth/wired route gets a two-second recovery
-  window with repeated speaker requests, so normal Android audio-policy
-  transitions do not terminate a long-running session prematurely.
+- Playback leaves the AudioTrack's preferred device unset so Android's audio
+  policy routes this media stream normally (built-in speaker, Bluetooth A2DP,
+  wired headset, or USB). The actual route is still verified after writing
+  starts: only a continuously missing route (no output device at all) is fatal,
+  with a two-second grace window so normal Bluetooth/headset transitions do not
+  terminate a long-running session.
 - A playback watchdog observes write progress and the Android playback head;
   if PC audio remains pending while both stop advancing for two seconds, the
   session is terminated with an explicit playback-stalled error instead of
@@ -130,8 +139,8 @@ present, then restores the original display state during cleanup. Separating
 the transition from the measured stream keeps the zero-drop assertion about
 steady screen-off playback rather than about emulator power-transition timing.
 
-An Android 16 emulator can complete cold install, speaker/playback-head
-readiness, READY, STATS, heartbeat, enforced built-in-speaker routing,
+An Android 16 emulator can complete cold install, playback-head
+readiness, READY, STATS, heartbeat, system-managed output routing,
 wake-lock visibility, STOP, and exact forward/service cleanup. Headless virtual
 audio is not a zero-drop timing oracle: a fresh 10-second run completed the
 protocol with route/focus state valid but reported virtual-audio underruns and
@@ -142,6 +151,33 @@ endurance remain open physical-device gates.
 Locking an already-streaming cold emulator can briefly stall its virtual
 `AudioTrack`; the bounded live-edge queue intentionally counts and discards stale
 frames in that case instead of preserving permanent playback delay.
+
+## Bluetooth output routing
+
+The stock companion calls `AudioTrack.setPreferredDevice(built-in speaker)` and
+fails the session if Android routes PC audio anywhere else. That deliberately
+pins output to the phone speaker and prevents a connected Bluetooth headset from
+playing PC audio.
+
+This build removes that forced selection (`PlaybackWorker.kt` no longer calls
+`setPreferredDevice`). The stream uses standard `USAGE_MEDIA` /
+`CONTENT_TYPE_MUSIC` attributes, so Android's normal media routing applies:
+
+- no other output → built-in speaker (unchanged behavior);
+- Bluetooth A2DP headset connected and active for media → Bluetooth;
+- wired headset / USB audio → that device.
+
+`RouteGraceTracker` and the periodic route check now treat *any* concrete output
+device as valid and only fail after a continuously missing route (no output at
+all) for the two-second grace window. Route changes, available output devices,
+AudioTrack initialization, and failures are logged under the
+`AudioShareUsbCompanion` tag (`adb logcat -s AudioShareUsbCompanion`).
+
+The USB wire protocol, audio format, handshake, package ID, and permissions are
+unchanged. The Windows host still requires the installed companion `base.apk`
+SHA-256 to match its bundled `android\audioshare-companion.apk`, so distributing
+this build means bundling this APK in the Windows package (or relaxing that
+host-side check).
 
 Release APKs require an external stable signing key; see
 [`docs/SIGNING.md`](docs/SIGNING.md). Tagged releases are built with the stable

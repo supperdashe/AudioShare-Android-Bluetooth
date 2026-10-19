@@ -9,6 +9,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
 import android.os.Process
+import android.util.Log
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -71,6 +72,12 @@ class PlaybackWorker(
 
     @Volatile
     private var routedDeviceType: Int = 0
+
+    // Tracks the last route type reported through Logcat so route transitions
+    // (for example Bluetooth A2DP connecting or disconnecting) are visible in
+    // diagnostics without spamming a log line every verification pass.
+    @Volatile
+    private var lastLoggedRouteType: Int = -1
 
     @Volatile
     private var configuredPerformanceMode: Int = AudioTrack.PERFORMANCE_MODE_NONE
@@ -195,10 +202,16 @@ class PlaybackWorker(
             configuredBufferFrames = configuredTrack.configuredBufferFrames
             startThresholdFrames = configuredTrack.startThresholdFrames
             configuredPerformanceMode = configuredTrack.performanceMode
-            val speaker = configuredTrack.speaker
+            Log.i(
+                TAG,
+                "AudioTrack initialized: performanceMode=${configuredTrack.performanceMode}, " +
+                    "bufferFrames=${configuredTrack.configuredBufferFrames}, " +
+                    "startThresholdFrames=${configuredTrack.startThresholdFrames}, " +
+                    "sampleRate=${format.sampleRate}, channels=${format.channels}",
+            )
             requestAudioFocus()
             track.play()
-            awaitPlaybackReady(track, speaker)
+            awaitPlaybackReady(track)
             ready.countDown()
             startPlaybackWatchdog(track)
 
@@ -206,7 +219,7 @@ class PlaybackWorker(
             while (running.get()) {
                 val now = System.nanoTime()
                 if (now >= nextRouteCheck) {
-                    verifyBuiltInSpeakerRoute(track, speaker, now)
+                    verifyRoutedOutput(track, now)
                     nextRouteCheck = now + TimeUnit.MILLISECONDS.toNanos(500)
                 }
                 val chunk = queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
@@ -251,6 +264,11 @@ class PlaybackWorker(
         } catch (error: Throwable) {
             startupError.compareAndSet(null, error)
             runtimeError.compareAndSet(null, error)
+            Log.e(
+                TAG,
+                "AudioTrack playback failed: " + (error.message ?: error.javaClass.simpleName),
+                error,
+            )
             ready.countDown()
         } finally {
             running.set(false)
@@ -286,7 +304,6 @@ class PlaybackWorker(
 
     private data class ConfiguredAudioTrack(
         val track: AudioTrack,
-        val speaker: AudioDeviceInfo,
         val bufferCapacityFrames: Int,
         val configuredBufferFrames: Int,
         val startThresholdFrames: Int,
@@ -297,6 +314,7 @@ class PlaybackWorker(
         channelMask: Int,
         bufferPlan: PlaybackBufferPlan,
     ): ConfiguredAudioTrack {
+        logOutputDevices()
         fun create(performanceMode: Int): AudioTrack = AudioTrack.Builder()
             .setAudioAttributes(audioAttributes)
             .setAudioFormat(
@@ -341,15 +359,14 @@ class PlaybackWorker(
                 } else {
                     configuredFrames
                 }
-                val speaker = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                    ?: throw IllegalStateException("This Android device has no built-in speaker output")
-                if (!candidate.setPreferredDevice(speaker)) {
-                    throw IllegalStateException("$label AudioTrack rejected the built-in speaker route")
-                }
+                // Do not force any single output device. Leaving the preferred
+                // device unset lets Android's audio policy route this media
+                // stream normally: built-in speaker when nothing else is
+                // active, Bluetooth A2DP when a headset is connected, and so
+                // on. That keeps speaker playback working while also allowing
+                // PC audio to reach a connected Bluetooth headset.
                 return ConfiguredAudioTrack(
                     track = candidate,
-                    speaker = speaker,
                     bufferCapacityFrames = capacityFrames,
                     configuredBufferFrames = configuredFrames,
                     startThresholdFrames = thresholdFrames,
@@ -370,10 +387,10 @@ class PlaybackWorker(
             return configure(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY, "Low-latency")
         } catch (error: RuntimeException) {
             try {
-                // Treat construction, buffer tuning, start threshold, and
-                // initial route selection as one atomic configuration. OEMs
-                // sometimes accept the low-latency builder but reject one of
-                // the later operations; the ordinary performance mode is the
+                // Treat construction, buffer tuning, and start-threshold
+                // configuration as one atomic sequence. OEMs sometimes accept
+                // the low-latency builder but reject one of the later
+                // operations; the ordinary performance mode is the
                 // compatibility fallback for that entire sequence.
                 return configure(AudioTrack.PERFORMANCE_MODE_NONE, "Compatibility")
             } catch (fallbackError: RuntimeException) {
@@ -443,24 +460,22 @@ class PlaybackWorker(
         }
     }
 
-    private fun awaitPlaybackReady(track: AudioTrack, speaker: AudioDeviceInfo) {
+    private fun awaitPlaybackReady(track: AudioTrack) {
         // READY means the receiver can actually consume audio, not merely that
         // AudioTrack.play() returned. A cold Android process can otherwise
         // stall its first writes during a screen-state transition and overflow
         // the bounded live-edge queue. Pace silent 10 ms periods until the
-        // playback head advances and confirm the real speaker route before
-        // allowing Windows capture to begin.
+        // playback head advances and Android confirms a concrete output route
+        // before allowing Windows capture to begin.
         val prime = ByteArray((format.sampleRate / 100) * bytesPerFrame())
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
         var nextPrimeWrite = 0L
-        var nextRouteRequest = 0L
         while (running.get()) {
             val now = System.nanoTime()
             if (now >= nextPrimeWrite) {
-                // setPreferredDevice may asynchronously recreate the native
-                // track on a cold process. Keep supplying silence at its real
-                // playback rate until the replacement advances; non-blocking
-                // writes keep the startup deadline enforceable.
+                // Keep supplying silence at its real playback rate until the
+                // playback head advances; non-blocking writes keep the startup
+                // deadline enforceable.
                 val written = track.write(prime, 0, prime.size, AudioTrack.WRITE_NON_BLOCKING)
                 if (written < 0) {
                     throw IllegalStateException("AudioTrack priming write failed: $written")
@@ -468,63 +483,38 @@ class PlaybackWorker(
                 nextPrimeWrite = now + TimeUnit.MILLISECONDS.toNanos(10)
             }
             val routed = track.routedDevice
-            routedDeviceType = routed?.type ?: 0
-            val routedToSpeaker = routed?.id == speaker.id &&
-                routed.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            if (!routedToSpeaker && now >= nextRouteRequest) {
-                // Some OEM policies briefly expose a stale Bluetooth/wired
-                // route while switching. Reassert the requested speaker for
-                // the same bounded interval already used for a missing route.
-                track.setPreferredDevice(speaker)
-                nextRouteRequest = now + TimeUnit.MILLISECONDS.toNanos(100)
-            }
-            if (routedToSpeaker &&
+            noteRoute(routed)
+            if (routed != null &&
                 (track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL) > 0L
             ) {
                 return
             }
             if (now >= deadline) {
                 if (routed == null) {
-                    throw IllegalStateException("Android did not confirm the phone speaker route")
+                    throw IllegalStateException("Android did not confirm an audio output route")
                 }
-                if (!routedToSpeaker) {
-                    throw IllegalStateException(
-                        "Android routed PC audio to ${deviceTypeName(routed.type)} instead of the phone speaker",
-                    )
-                }
-                throw IllegalStateException("Android speaker playback did not begin")
+                throw IllegalStateException("Android playback did not begin")
             }
             Thread.sleep(5)
         }
         throw InterruptedException("Playback stopped during startup")
     }
 
-    private fun verifyBuiltInSpeakerRoute(
-        track: AudioTrack,
-        speaker: AudioDeviceInfo,
-        nowNanos: Long,
-    ) {
+    private fun verifyRoutedOutput(track: AudioTrack, nowNanos: Long) {
         val routed = track.routedDevice
-        routedDeviceType = routed?.type ?: 0
+        noteRoute(routed)
         val observation = routeGraceTracker.observe(
             nowNanos = nowNanos,
-            routedToSpeaker = routed?.id == speaker.id &&
-                routed.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
-            routedToOtherDevice = routed != null &&
-                (routed.id != speaker.id || routed.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER),
+            routed = routed != null,
         )
         if (observation == RouteGraceTracker.Observation.VALID) return
-        // Retrying is harmless and shortens recovery when Android reports a
-        // transiently stale route after Bluetooth or a headset disconnects.
-        track.setPreferredDevice(speaker)
         if (observation == RouteGraceTracker.Observation.EXPIRED) {
-            if (routed != null) {
-                throw IllegalStateException(
-                    "Android routed PC audio to ${deviceTypeName(routed.type)} instead of the phone speaker",
-                )
-            }
-            throw IllegalStateException("Android did not confirm the phone speaker route")
+            throw IllegalStateException("Android did not confirm an audio output route")
         }
+        // GRACE: Android can briefly report no route while it rebuilds its
+        // audio policy after a Bluetooth or wired-headset transition. Keep the
+        // session alive for the bounded recovery window instead of terminating
+        // a long-running stream during a normal device switch.
     }
 
     private fun startPlaybackWatchdog(track: AudioTrack) {
@@ -597,9 +587,15 @@ class PlaybackWorker(
     }
 
     private fun deviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "phone speaker"
         AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
         -> "Bluetooth audio"
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_BLE_SPEAKER,
+        -> "Bluetooth LE audio"
+        AudioDeviceInfo.TYPE_HEARING_AID -> "hearing aid"
         AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
         AudioDeviceInfo.TYPE_WIRED_HEADSET,
         -> "wired audio"
@@ -608,6 +604,38 @@ class PlaybackWorker(
         AudioDeviceInfo.TYPE_USB_ACCESSORY,
         -> "USB audio"
         else -> "output type $type"
+    }
+
+    /**
+     * Records the current route for STATS diagnostics and logs route changes
+     * to Logcat. Only device type names and ids are emitted; no user
+     * identifiers or protocol secrets are logged.
+     */
+    private fun noteRoute(routed: AudioDeviceInfo?) {
+        val type = routed?.type ?: 0
+        routedDeviceType = type
+        if (type == lastLoggedRouteType) return
+        lastLoggedRouteType = type
+        if (routed == null) {
+            Log.w(TAG, "Android reports no audio output route")
+        } else {
+            Log.i(TAG, "Audio output routed to ${deviceTypeName(type)} (id=${routed.id})")
+        }
+    }
+
+    /** Logs the output devices Android currently makes available for media. */
+    private fun logOutputDevices() {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        if (devices.isEmpty()) {
+            Log.w(TAG, "No audio output devices are currently available")
+            return
+        }
+        Log.i(
+            TAG,
+            "Available audio output devices: " + devices.joinToString(", ") {
+                "${deviceTypeName(it.type)} (id=${it.id})"
+            },
+        )
     }
 
     private fun bytesPerFrame(): Int = format.channels * (format.bitsPerSample / 8)
@@ -693,6 +721,7 @@ class PlaybackWorker(
     }
 
     companion object {
+        private const val TAG = "AudioShareUsbCompanion"
         const val FOCUS_NONE = 0
         const val FOCUS_GAINED = 1
         const val FOCUS_DUCKED = 2
